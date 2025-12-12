@@ -19,7 +19,7 @@ class MusicPlayerGUI:
         self.root = root
         self.root.title("Game Music Player - GUI")
         # Slightly larger default size so all sections are visible without manual resize
-        self.root.geometry("800x800")
+        self.root.geometry("1000x900")  # Increased size for better default layout
         self.root.resizable(True, True)
 
         # Initialize the music player, score reader, and MIDI transcriber
@@ -27,6 +27,7 @@ class MusicPlayerGUI:
         self.score_reader = MusicScoreReader()
         self.midi_transcriber = MIDIToJianpuTranscriber()
         self.is_playing = False
+        self.current_midi_file = None  # Track currently loaded MIDI for re-transcription
 
         self.setup_ui()
 
@@ -139,17 +140,175 @@ class MusicPlayerGUI:
         mode_info_label = ttk.Label(settings_frame, textvariable=self.mode_info_var, foreground="gray")
         mode_info_label.grid(row=1, column=4, sticky=tk.W, padx=(20, 0), pady=(10, 0))
 
-        # Add a Help button to explain settings
-        help_button = ttk.Button(settings_frame, text="Help", command=self.show_help)
-        help_button.grid(row=0, column=0, sticky=tk.W, padx=(0, 10))
+        # Row 2: MIDI Filtering Mode
+        ttk.Label(settings_frame, text="MIDI Filter:").grid(row=2, column=0, sticky=tk.W, pady=(10, 0))
+        self.filter_var = tk.StringVar(value="full")
+        filter_combo = ttk.Combobox(settings_frame, textvariable=self.filter_var, width=12,
+                                    values=["full", "clean", "minimal"], state="readonly")
+        filter_combo.grid(row=2, column=1, sticky=tk.W, padx=(10, 0), pady=(10, 0))
+        filter_combo.bind("<<ComboboxSelected>>", lambda e: self.update_filter_mode())
+
+        # Filter info label
+        self.filter_info_var = tk.StringVar(value="Full: all notes, no filtering")
+        filter_info_label = ttk.Label(settings_frame, textvariable=self.filter_info_var, foreground="gray")
+        filter_info_label.grid(row=2, column=2, columnspan=2, sticky=tk.W, padx=(20, 0), pady=(10, 0))
+
+        # Polyphonic mode checkbox
+        self.polyphonic_var = tk.BooleanVar(value=True)
+        polyphonic_check = ttk.Checkbutton(settings_frame, text="Polyphonic (chords)",
+                                           variable=self.polyphonic_var,
+                                           command=self.update_polyphonic_mode)
+        polyphonic_check.grid(row=2, column=4, sticky=tk.W, padx=(10, 0), pady=(10, 0))
+
+        # Row 3: Multi-track MIDI options
+        ttk.Label(settings_frame, text="Multi-track:").grid(row=3, column=0, sticky=tk.W, pady=(10, 0))
+
+        # Melody only checkbox
+        self.melody_only_var = tk.BooleanVar(value=False)
+        melody_check = ttk.Checkbutton(settings_frame, text="Melody only",
+                                       variable=self.melody_only_var,
+                                       command=self.update_melody_mode)
+        melody_check.grid(row=3, column=1, sticky=tk.W, padx=(10, 0), pady=(10, 0))
+
+        # Exclude drums checkbox
+        self.exclude_drums_var = tk.BooleanVar(value=True)
+        drums_check = ttk.Checkbutton(settings_frame, text="Exclude drums",
+                                      variable=self.exclude_drums_var,
+                                      command=self.update_drums_setting)
+        drums_check.grid(row=3, column=2, sticky=tk.W, padx=(10, 0), pady=(10, 0))
+
+        # Max chord size
+        ttk.Label(settings_frame, text="Max chord:").grid(row=3, column=3, sticky=tk.W, padx=(10, 0), pady=(10, 0))
+        self.max_chord_var = tk.StringVar(value="3")
+        max_chord_spinbox = ttk.Spinbox(settings_frame, from_=0, to=10, increment=1,
+                                        width=5, textvariable=self.max_chord_var)
+        max_chord_spinbox.grid(row=3, column=4, sticky=tk.W, padx=(5, 0), pady=(10, 0))
+        self.max_chord_var.trace('w', lambda *args: self.update_max_chord())
+
+        # Help button
+        help_button = ttk.Button(settings_frame, text="?", command=self.show_help, width=3)
+        help_button.grid(row=0, column=5, padx=(10, 0))
+
+    def update_melody_mode(self):
+        """Toggle melody-only mode for MIDI transcription."""
+        enabled = self.melody_only_var.get()
+        self.midi_transcriber.melody_track_only = enabled
+        self.log(f"Melody-only mode: {'enabled' if enabled else 'disabled'}")
+        if self.current_midi_file:
+            self._retranscribe_midi()
+
+    def update_drums_setting(self):
+        """Toggle drum exclusion for MIDI transcription."""
+        enabled = self.exclude_drums_var.get()
+        self.midi_transcriber.exclude_drums = enabled
+        self.log(f"Exclude drums: {'enabled' if enabled else 'disabled'}")
+        if self.current_midi_file:
+            self._retranscribe_midi()
+
+    def update_max_chord(self):
+        """Update max chord size setting."""
+        try:
+            val = int(self.max_chord_var.get())
+            if val < 0:
+                val = 0
+            self.midi_transcriber.max_chord_size = val
+            # Don't log on every keystroke, only retranscribe if file loaded
+        except ValueError:
+            pass
+
+    def update_polyphonic_mode(self):
+        """Toggle polyphonic mode for MIDI transcription."""
+        enabled = self.polyphonic_var.get()
+        self.midi_transcriber.polyphonic_mode = enabled
+        mode_str = "enabled (chords)" if enabled else "disabled (sequential)"
+        self.log(f"Polyphonic mode: {mode_str}")
+
+        # Regenerate notes if a MIDI file is loaded
+        if self.current_midi_file:
+            self.log(f"Re-transcribing MIDI with polyphonic={enabled}...")
+            self._retranscribe_midi()
+
+    def update_filter_mode(self):
+        """Update the MIDI filtering mode and regenerate notes if MIDI is loaded."""
+        mode = self.filter_var.get()
+        if mode == "full":
+            self.midi_transcriber.set_transcription_options(
+                min_duration=0.001,
+                remove_duplicates=False
+            )
+            self.filter_info_var.set("Full: all notes, no filtering")
+        elif mode == "clean":
+            self.midi_transcriber.set_transcription_options(
+                min_duration=0.1,
+                remove_duplicates=True,
+                duplicate_threshold=0.1
+            )
+            self.filter_info_var.set("Clean: removes short notes (<100ms)")
+        elif mode == "minimal":
+            self.midi_transcriber.set_transcription_options(
+                min_duration=0.2,
+                remove_duplicates=True,
+                duplicate_threshold=0.15
+            )
+            self.filter_info_var.set("Minimal: melody only, heavy filtering")
+        self.log(f"MIDI filter mode: {mode}")
+
+        # Regenerate notes if a MIDI file is currently loaded
+        if self.current_midi_file:
+            self.log(f"Re-transcribing MIDI with {mode} filter...")
+            self._retranscribe_midi()
+
+    def _retranscribe_midi(self):
+        """Re-transcribe the currently loaded MIDI file with new filter settings."""
+        if not self.current_midi_file:
+            return
+
+        def worker():
+            try:
+                jianpu_notes = self.midi_transcriber.transcribe_midi_file(self.current_midi_file)
+                if jianpu_notes:
+                    def update_ui():
+                        self.song_text.delete(1.0, tk.END)
+                        self.song_text.insert(1.0, jianpu_notes)
+                        # Use proper parsing to count tokens (handles chords correctly)
+                        tokens = self.player.parse_notes(jianpu_notes)
+                        note_count = len(tokens)
+                        poly_str = "polyphonic" if self.polyphonic_var.get() else "sequential"
+                        self.upload_status_var.set(f"✅ Re-transcribed: {note_count} tokens ({self.filter_var.get()}, {poly_str})")
+                        self.log(f"Re-transcribed: {note_count} tokens")
+                    self.root.after(0, update_ui)
+                else:
+                    self.log("Re-transcription failed")
+            except Exception as e:
+                self.log(f"Error re-transcribing: {e}")
+
+        import threading
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
 
     def show_help(self):
         """Display a help message explaining the settings."""
         help_text = (
             "Settings Help:\n\n"
-            "1. Default/Guqin Style: Plays the music in a traditional Guqin style.\n"
-            "2. Tempo Adjustment: Adjusts the playing speed to make it faster or slower.\n"
-            "Use the slider to control the tempo.\n"
+            "Note Delay: Time between notes during playback.\n\n"
+            "Countdown: Seconds before playback starts (to focus game window).\n\n"
+            "Playing Mode:\n"
+            "  • Guqin: Slow, expressive, with wait commands\n"
+            "  • Fast: 4x speed, no waits\n"
+            "  • Custom: User-defined tempo multiplier\n\n"
+            "Tempo: Speed multiplier (1.0 = normal, 2.0 = 2x faster)\n\n"
+            "MIDI Filter:\n"
+            "  • Full: All notes, no filtering (may sound busy)\n"
+            "  • Clean: Removes short notes <100ms (recommended)\n"
+            "  • Minimal: Melody only, removes ornaments/fast runs\n\n"
+            "Polyphonic (chords):\n"
+            "  • Enabled: Simultaneous notes become chords [note1 note2]\n"
+            "  • Disabled: Notes played sequentially\n\n"
+            "Multi-track Options (for complex MIDIs):\n"
+            "  • Melody only: Auto-detect and use melody track\n"
+            "  • Exclude drums: Filters out percussion (channel 10)\n"
+            "  • Max chord: Limits notes per chord (0 = unlimited)\n"
+            "  • Pick Tracks: Manually select which tracks to use"
         )
         messagebox.showinfo("Settings Help", help_text)
 
@@ -182,10 +341,15 @@ class MusicPlayerGUI:
                              command=self.upload_midi_file, width=18)
         midi_btn.grid(row=1, column=1, sticky=tk.W, padx=(5, 0))
 
+        # Track picker button (for multi-track MIDIs)
+        track_btn = ttk.Button(upload_frame, text="🎼 Pick Tracks",
+                              command=self.show_track_picker, width=12)
+        track_btn.grid(row=1, column=2, sticky=tk.W, padx=(5, 0))
+
         # Add Huangpu conversion button
-        huangpu_btn = ttk.Button(upload_frame, text="📄 Convert MusicXML/PDF → Huangpu",
-                                 command=self.convert_musicxml_pdf_to_huangpu, width=28)
-        huangpu_btn.grid(row=1, column=2, sticky=tk.W, padx=(5, 0))
+        huangpu_btn = ttk.Button(upload_frame, text="📄 MusicXML→Huangpu",
+                                 command=self.convert_musicxml_pdf_to_huangpu, width=18)
+        huangpu_btn.grid(row=1, column=3, sticky=tk.W, padx=(5, 0))
 
         # File path display
         self.file_path_var = tk.StringVar(value="No file selected")
@@ -347,6 +511,128 @@ class MusicPlayerGUI:
             # Reset to default value
             self.countdown_var.set("3")
             self.log("Invalid countdown value - reset to 3 seconds")
+
+    def show_track_picker(self):
+        """Show a dialog to pick specific tracks from a MIDI file."""
+        if not self.current_midi_file:
+            # Ask user to select a MIDI file first
+            file_path = filedialog.askopenfilename(
+                title="Select MIDI File to analyze tracks",
+                filetypes=[("MIDI files", "*.mid;*.midi"), ("All files", "*.*")]
+            )
+            if not file_path:
+                return
+            self.current_midi_file = file_path
+            self.file_path_var.set(os.path.basename(file_path))
+
+        # Analyze the MIDI file tracks
+        try:
+            import mido
+            mid = mido.MidiFile(self.current_midi_file)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not read MIDI file: {e}")
+            return
+
+        # Create track picker dialog
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Select MIDI Tracks")
+        dialog.geometry("600x400")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        # Instructions
+        ttk.Label(dialog, text="Select tracks to include in transcription:",
+                  font=("Arial", 10, "bold")).pack(pady=(10, 5))
+        ttk.Label(dialog, text="🎵 = likely melody, 🥁 = drums, 🎸 = bass",
+                  foreground="gray").pack()
+
+        # Scrollable frame for track list
+        list_frame = ttk.Frame(dialog)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # Create listbox with scrollbar
+        scrollbar = ttk.Scrollbar(list_frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        listbox = tk.Listbox(list_frame, selectmode=tk.MULTIPLE,
+                             yscrollcommand=scrollbar.set, font=("Courier", 10))
+        listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.config(command=listbox.yview)
+
+        # Analyze and populate tracks
+        track_info = []
+        for i, track in enumerate(mid.tracks):
+            notes = []
+            channels = set()
+            for msg in track:
+                if msg.type == 'note_on' and msg.velocity > 0:
+                    channel = getattr(msg, 'channel', 0)
+                    channels.add(channel)
+                    notes.append(msg.note)
+
+            if not notes:
+                continue
+
+            name = track.name[:20] if track.name else "(unnamed)"
+            note_count = len(notes)
+            avg_pitch = sum(notes) / len(notes)
+
+            # Determine type icon
+            if 9 in channels:
+                icon = "🥁"
+            elif avg_pitch > 70:
+                icon = "🎵"
+            elif avg_pitch < 50:
+                icon = "🎸"
+            else:
+                icon = "🎹"
+
+            display = f"{icon} Track {i}: {name:<20} ({note_count} notes, avg pitch {avg_pitch:.0f})"
+            listbox.insert(tk.END, display)
+            track_info.append((i, name, note_count, 9 in channels))
+
+        # Buttons frame
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=10)
+
+        def select_all():
+            listbox.select_set(0, tk.END)
+
+        def select_none():
+            listbox.select_clear(0, tk.END)
+
+        def select_no_drums():
+            listbox.select_clear(0, tk.END)
+            for idx, (track_idx, name, count, is_drum) in enumerate(track_info):
+                if not is_drum:
+                    listbox.select_set(idx)
+
+        def apply_selection():
+            selected_indices = listbox.curselection()
+            if not selected_indices:
+                messagebox.showwarning("No Selection", "Please select at least one track.")
+                return
+
+            # Get the actual track indices
+            selected_tracks = [track_info[i][0] for i in selected_indices]
+            self.midi_transcriber.selected_tracks = selected_tracks
+            self.midi_transcriber.melody_track_only = False  # Disable melody-only when using manual selection
+            self.melody_only_var.set(False)
+
+            self.log(f"Selected tracks: {selected_tracks}")
+            dialog.destroy()
+
+            # Re-transcribe with selected tracks
+            self._retranscribe_midi()
+
+        ttk.Button(btn_frame, text="Select All", command=select_all).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Select None", command=select_none).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="No Drums", command=select_no_drums).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Apply", command=apply_selection).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
+
+        # Pre-select non-drum tracks
+        select_no_drums()
 
     def test_delay(self):
         """Test the current delay setting with a short sequence."""
@@ -655,12 +941,15 @@ class MusicPlayerGUI:
             if jianpu_notes:
                 self.log(f"Successfully transcribed MIDI: {jianpu_notes[:100]}...")
 
+                # Store the MIDI file path for re-transcription when filter changes
+                self.current_midi_file = file_path
+
                 # Update the song input with transcribed notes
                 def update_song_input():
                     self.song_text.delete(1.0, tk.END)
                     self.song_text.insert(1.0, jianpu_notes)
                     note_count = len(jianpu_notes.split())
-                    self.upload_status_var.set(f"✅ Transcribed {note_count} notes from MIDI")
+                    self.upload_status_var.set(f"✅ Transcribed {note_count} notes from MIDI ({self.filter_var.get()} filter)")
 
                 self.root.after(0, update_song_input)
 

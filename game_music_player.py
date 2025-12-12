@@ -148,17 +148,52 @@ class GameMusicPlayer:
 
     def parse_notes(self, note_string: str) -> List[str]:
         """
-        Parse a string of notes into a list of individual notes.
+        Parse a string of notes into a list of individual notes or chords.
 
         Args:
-            note_string: String containing notes like "High1 Med3 Low5"
+            note_string: String containing notes like "High1 Med3 Low5" or chords "[Med1 Med3 Med5]"
 
         Returns:
-            List of individual note strings
+            List of individual note strings or chord strings (with brackets)
         """
-        # Split by whitespace and filter out empty strings
-        notes = [note.strip() for note in note_string.split() if note.strip()]
-        return notes
+        result = []
+        i = 0
+        chars = note_string
+
+        while i < len(chars):
+            # Skip whitespace
+            while i < len(chars) and chars[i].isspace():
+                i += 1
+
+            if i >= len(chars):
+                break
+
+            # Check for chord notation [note1 note2 ...]
+            if chars[i] == '[':
+                # Find matching closing bracket
+                bracket_start = i
+                bracket_depth = 1
+                i += 1
+                while i < len(chars) and bracket_depth > 0:
+                    if chars[i] == '[':
+                        bracket_depth += 1
+                    elif chars[i] == ']':
+                        bracket_depth -= 1
+                    i += 1
+                # Extract the chord including brackets
+                chord = chars[bracket_start:i].strip()
+                if chord:
+                    result.append(chord)
+            else:
+                # Regular note - read until whitespace or bracket
+                note_start = i
+                while i < len(chars) and not chars[i].isspace() and chars[i] != '[':
+                    i += 1
+                note = chars[note_start:i].strip()
+                if note:
+                    result.append(note)
+
+        return result
 
     # New parsing helpers for semitone support
     def _split_note_and_duration(self, token: str) -> tuple[str, Optional[str]]:
@@ -231,12 +266,39 @@ class GameMusicPlayer:
         finally:
             pydirectinput.keyUp(modifier)
 
+    def is_chord(self, token: str) -> bool:
+        """Check if a token is a chord notation (e.g., '[Med1 Med3 Med5]')."""
+        return token.startswith('[') and token.endswith(']')
+
+    def parse_chord(self, chord_token: str) -> List[str]:
+        """Parse a chord token into individual notes.
+
+        Args:
+            chord_token: Chord string like "[Med1:q Med3:q Med5:q]"
+
+        Returns:
+            List of individual note strings
+        """
+        # Remove brackets and split by whitespace
+        inner = chord_token[1:-1].strip()
+        return [n.strip() for n in inner.split() if n.strip()]
+
     def validate_note(self, note: str) -> bool:
-        """Validate if a note, rest, or wait command is syntactically valid.
+        """Validate if a note, rest, chord, or wait command is syntactically valid.
 
         Supports duration markers (e.g., "Med1:q", "High#3:e"), rests ("0" or "0:q"),
-        and wait keywords.
+        chords (e.g., "[Med1 Med3 Med5]"), and wait keywords.
         """
+        # Check if it's a chord
+        if self.is_chord(note):
+            chord_notes = self.parse_chord(note)
+            # All notes in the chord must be valid
+            return all(self._validate_single_note(n) for n in chord_notes)
+
+        return self._validate_single_note(note)
+
+    def _validate_single_note(self, note: str) -> bool:
+        """Validate a single note (not a chord)."""
         # Check if it's a wait command
         if self.is_wait_command(note):
             return True
@@ -306,7 +368,11 @@ class GameMusicPlayer:
         Supports duration markers (e.g., "Med1:q", "High#3:e"), rests ("0" or "0:q"),
         and semitone notes using Shift (sharp) and Ctrl (flat).
         """
-        # Handle wait commands first
+        # Handle chords (simultaneous notes)
+        if self.is_chord(note):
+            return self.play_chord(note)
+
+        # Handle wait commands
         if self.is_wait_command(note):
             return self.execute_wait_command(note)
 
@@ -373,6 +439,102 @@ class GameMusicPlayer:
             return True
         except Exception as e:
             print(f"Error playing note {base}: {e}")
+            return False
+
+    def play_chord(self, chord_token: str) -> bool:
+        """Play a chord by pressing multiple keys simultaneously.
+
+        Args:
+            chord_token: Chord string like "[Med1:q Med3:q Med5:q]"
+
+        Returns:
+            True if chord was played successfully, False otherwise
+        """
+        chord_notes = self.parse_chord(chord_token)
+        if not chord_notes:
+            print(f"Warning: Empty chord '{chord_token}' - skipping")
+            return False
+
+        # Prepare all keys and modifiers to press
+        keys_to_press = []
+        max_duration = 0.0
+
+        for note in chord_notes:
+            base, duration_code = self._split_note_and_duration(note)
+
+            # Skip rests in chords
+            if base == '0':
+                continue
+
+            octave, accidental, degree = self._split_note_components(base)
+            if octave is None or degree is None:
+                print(f"Warning: Unknown note '{base}' in chord - skipping")
+                continue
+
+            base_key = self._build_base_note_key(octave, degree)
+            if base_key not in self.note_map:
+                print(f"Warning: Unknown note '{base}' in chord - skipping")
+                continue
+
+            key = self.note_map[base_key]
+            modifier = self._get_modifier_for_accidental(accidental)
+            keys_to_press.append((key, modifier, note))
+
+            # Track the longest duration in the chord
+            note_duration = self._get_duration_from_code(duration_code)
+            max_duration = max(max_duration, note_duration)
+
+        if not keys_to_press:
+            return False
+
+        try:
+            # Press all modifier keys first
+            modifiers_held = set()
+            for key, modifier, note in keys_to_press:
+                if modifier and modifier not in modifiers_held:
+                    pydirectinput.keyDown(modifier)
+                    modifiers_held.add(modifier)
+
+            # Press all note keys simultaneously
+            for key, modifier, note in keys_to_press:
+                pydirectinput.keyDown(key)
+
+            # Brief hold for the chord to register
+            time.sleep(0.02)
+
+            # Release all note keys
+            for key, modifier, note in keys_to_press:
+                pydirectinput.keyUp(key)
+
+            # Release all modifier keys
+            for modifier in modifiers_held:
+                pydirectinput.keyUp(modifier)
+
+            # Log what was played
+            note_names = [n for _, _, n in keys_to_press]
+            print(f"Played chord: [{' '.join(note_names)}]")
+
+            # Track the last played note (use the first note of the chord)
+            self.last_played_note = chord_notes[0]
+
+            # Sleep for the chord duration
+            time.sleep(max_duration)
+
+            return True
+
+        except Exception as e:
+            # Make sure to release any held keys on error
+            for key, modifier, note in keys_to_press:
+                try:
+                    pydirectinput.keyUp(key)
+                except:
+                    pass
+            for modifier in modifiers_held:
+                try:
+                    pydirectinput.keyUp(modifier)
+                except:
+                    pass
+            print(f"Error playing chord: {e}")
             return False
 
     def execute_wait_command(self, wait_command: str) -> bool:

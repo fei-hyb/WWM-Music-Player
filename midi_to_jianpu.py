@@ -67,6 +67,17 @@ class MIDIToJianpuTranscriber:
         # Chord detection window (seconds)
         self.chord_time_window = 0.05
 
+        # Polyphonic mode: output chords as [note1 note2 note3] for simultaneous playback
+        # When True, chords are grouped with brackets for the player to press keys simultaneously
+        # When False, chord notes are output sequentially (legacy behavior)
+        self.polyphonic_mode = True
+
+        # Multi-track MIDI handling options
+        self.exclude_drums = True  # Exclude MIDI channel 10 (drums/percussion)
+        self.max_chord_size = 3    # Maximum notes in a chord (0 = unlimited)
+        self.melody_track_only = False  # If True, only use the track with highest average pitch
+        self.selected_tracks = None  # List of track indices to include, or None for all
+
         # Debug flag for extra logging about filtering/mapping
         self.debug = debug
 
@@ -120,14 +131,28 @@ class MIDIToJianpuTranscriber:
             mid = mido.MidiFile(midi_path)
             all_notes = []
 
-            # Merge all tracks into a single timeline for better synchronization
-            merged_track = mido.merge_tracks(mid.tracks)
+            # If melody_track_only is set, find the best melody track
+            if self.melody_track_only:
+                best_track_idx = self._find_melody_track(mid)
+                logger.info(f"Melody track mode: using track {best_track_idx}")
+                tracks_to_use = [mid.tracks[best_track_idx]]
+            elif self.selected_tracks is not None:
+                tracks_to_use = [mid.tracks[i] for i in self.selected_tracks if i < len(mid.tracks)]
+                logger.info(f"Using selected tracks: {self.selected_tracks}")
+            else:
+                tracks_to_use = mid.tracks
+
+            # Merge selected tracks into a single timeline
+            merged_track = mido.merge_tracks(tracks_to_use)
 
             # Track note states for proper duration calculation
-            active_notes = {}  # {note_number: (start_time, velocity)}
+            active_notes = {}  # {(channel, note_number): (start_time, velocity)}
             current_time = 0
             tempo = 500000  # Default tempo (120 BPM)
             ticks_per_beat = mid.ticks_per_beat
+
+            # Track current channel for each note
+            current_channel = 0
 
             for msg in merged_track:
                 # Convert ticks to seconds
@@ -142,13 +167,22 @@ class MIDIToJianpuTranscriber:
 
                 # Handle note on events
                 elif msg.type == 'note_on' and msg.velocity > 0:
-                    # Store both start time and velocity
-                    active_notes[msg.note] = (current_time, msg.velocity)
+                    channel = getattr(msg, 'channel', 0)
+
+                    # Skip drum channel (channel 9 in 0-indexed, channel 10 in 1-indexed)
+                    if self.exclude_drums and channel == 9:
+                        continue
+
+                    # Store both start time and velocity with channel
+                    active_notes[(channel, msg.note)] = (current_time, msg.velocity)
 
                 # Handle note off events (including note_on with velocity 0)
                 elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
-                    if msg.note in active_notes:
-                        start_time, velocity = active_notes[msg.note]
+                    channel = getattr(msg, 'channel', 0)
+                    key = (channel, msg.note)
+
+                    if key in active_notes:
+                        start_time, velocity = active_notes[key]
                         duration = current_time - start_time
 
                         # Convert MIDI note to Jianpu
@@ -157,10 +191,10 @@ class MIDIToJianpuTranscriber:
                             # Store velocity normalized to 0-1
                             all_notes.append((start_time, jianpu_note, duration, velocity / 127.0))
 
-                        del active_notes[msg.note]
+                        del active_notes[key]
 
             # Handle any remaining active notes (songs that don't end cleanly)
-            for note_num, (start_time, velocity) in active_notes.items():
+            for (channel, note_num), (start_time, velocity) in active_notes.items():
                 jianpu_note = self._midi_note_to_jianpu(note_num)
                 if jianpu_note:
                     duration = 0.5  # Default duration for unclosed notes
@@ -177,6 +211,63 @@ class MIDIToJianpuTranscriber:
             logger.warning(f"mido transcription failed: {e}")
 
         return None
+
+    def _find_melody_track(self, mid) -> int:
+        """Find the track most likely to be the melody based on name, pitch range, and note count."""
+        best_track = 0
+        best_score = -1
+
+        # Keywords that suggest melody tracks (case-insensitive)
+        melody_keywords = ['melody', 'lead', 'vocal', 'voice', 'flute', 'violin', 'solo']
+        # Keywords that suggest non-melody tracks
+        avoid_keywords = ['drum', 'bass', 'chord', 'pad', 'percussion', 'kick', 'snare', 'hat']
+
+        for i, track in enumerate(mid.tracks):
+            notes = []
+            for msg in track:
+                if msg.type == 'note_on' and msg.velocity > 0:
+                    channel = getattr(msg, 'channel', 0)
+                    # Skip drum channel
+                    if channel == 9:
+                        continue
+                    notes.append(msg.note)
+
+            if not notes:
+                continue
+
+            # Base score from pitch and note count
+            avg_pitch = sum(notes) / len(notes)
+            note_count = len(notes)
+
+            # Prefer tracks with notes in the melody range (60-84) and not too many notes
+            melody_range_notes = sum(1 for n in notes if 60 <= n <= 84)
+            melody_ratio = melody_range_notes / len(notes) if notes else 0
+
+            # Base score: high average pitch + good melody ratio + reasonable note count
+            score = avg_pitch * 0.5 + melody_ratio * 30 + min(note_count, 500) * 0.1
+
+            # Check track name for hints
+            track_name = (track.name or "").lower()
+
+            # Big bonus for melody-related names
+            for keyword in melody_keywords:
+                if keyword in track_name:
+                    score += 50  # Strong preference
+                    break
+
+            # Penalty for non-melody track names
+            for keyword in avoid_keywords:
+                if keyword in track_name:
+                    score -= 30
+                    break
+
+            if score > best_score:
+                best_score = score
+                best_track = i
+
+        return best_track
+
+        return best_track
 
     def _try_music21_transcription(self, midi_path: str) -> Optional[str]:
         """Try transcribing using music21 library."""
@@ -321,6 +412,37 @@ class MIDIToJianpuTranscriber:
 
         return jianpu_label
 
+    def _get_midi_from_jianpu(self, jianpu: str) -> int:
+        """Get approximate MIDI note number from Jianpu label for sorting purposes.
+
+        Returns higher values for higher pitches. Used for chord sorting.
+        """
+        import re
+
+        # Parse: High#3, Med1, Lowb7, etc.
+        match = re.match(r'(High|Med|Low)([#b]?)(\d)', jianpu)
+        if not match:
+            return 60  # Default to middle C
+
+        range_name, accidental, degree = match.groups()
+        degree = int(degree)
+
+        # Base MIDI for each range
+        range_base = {'Low': 48, 'Med': 60, 'High': 72}
+        base = range_base.get(range_name, 60)
+
+        # Jianpu degree to semitone offset (1=C, 2=D, 3=E, 4=F, 5=G, 6=A, 7=B)
+        degree_offsets = {1: 0, 2: 2, 3: 4, 4: 5, 5: 7, 6: 9, 7: 11}
+        offset = degree_offsets.get(degree, 0)
+
+        # Apply accidental
+        if accidental == '#':
+            offset += 1
+        elif accidental == 'b':
+            offset -= 1
+
+        return base + offset
+
     def _estimate_note_duration(self, track, note_msg, current_time) -> float:
         """Estimate note duration from MIDI track (simplified)."""
         # This is a simplified estimation - in practice you'd track note_off events
@@ -413,11 +535,28 @@ class MIDIToJianpuTranscriber:
                     break
 
             if len(chord_group) > 1:
-                # Output all notes in the chord group instead of just the highest
-                for chord_time, chord_note, chord_dur, chord_vel in chord_group:
-                    note_with_duration = self._add_duration_marker(chord_note, chord_dur)
-                    jianpu_sequence.append(note_with_duration)
-                    range_counts[_range_from_label(chord_note)] += 1
+                # Multiple notes at the same time - output as chord
+                if self.polyphonic_mode:
+                    # Apply max_chord_size limit if set
+                    if self.max_chord_size > 0 and len(chord_group) > self.max_chord_size:
+                        # Sort by pitch (higher notes first - usually melody) then by velocity
+                        chord_group.sort(key=lambda x: (-self._get_midi_from_jianpu(x[1]), -x[3]))
+                        chord_group = chord_group[:self.max_chord_size]
+
+                    # Output chord in bracket notation for simultaneous key presses
+                    chord_notes = []
+                    for chord_time, chord_note, chord_dur, chord_vel in chord_group:
+                        note_with_duration = self._add_duration_marker(chord_note, chord_dur)
+                        chord_notes.append(note_with_duration)
+                        range_counts[_range_from_label(chord_note)] += 1
+                    # Format: [Med1:q Med3:q Med5:q] for simultaneous playback
+                    jianpu_sequence.append("[" + " ".join(chord_notes) + "]")
+                else:
+                    # Legacy: output all notes in the chord group sequentially
+                    for chord_time, chord_note, chord_dur, chord_vel in chord_group:
+                        note_with_duration = self._add_duration_marker(chord_note, chord_dur)
+                        jianpu_sequence.append(note_with_duration)
+                        range_counts[_range_from_label(chord_note)] += 1
             else:
                 selected_time, selected_note, selected_dur, selected_vel = chord_group[0]
                 note_with_duration = self._add_duration_marker(selected_note, selected_dur)

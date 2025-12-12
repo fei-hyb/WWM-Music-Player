@@ -26,8 +26,9 @@ repro_data = [
     'requirements.txt',
     'README.md',
     'PDF_READER_GUIDE.md',
-    'Instruction.md',
     'achineseghoststory.mid',
+    '(Yukiko Niijima) FFVIII - Balamb Garden.mid',
+    "(Mielle Uccello) Tifa's Theme (Final Fantasy 7).mid",
 ]
 
 a = Analysis(
