@@ -1,6 +1,8 @@
 # Game Music Player
 
-Automates playing musical instruments in PC games using keyboard input. Uses `pydirectinput` for reliable key input that works with DirectX games where standard `pyautogui` might fail.
+Automates playing musical instruments for the game "Where Winds Meet"
+
+To download the .exe, navigate to the dist folder and download GameMusicPlayer.zip
 
 ## Features
 
