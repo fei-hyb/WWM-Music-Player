@@ -1,6 +1,7 @@
 # Game Music Player
 
 Automated music player for the game "Where Winds Meet".
+For .exe and instruction, look under dist folder.
 
 ## Features
 - User-friendly GUI for playing and converting music
