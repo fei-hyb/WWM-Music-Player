@@ -27,6 +27,7 @@ class MusicPlayerGUI:
         self.score_reader = MusicScoreReader()
         self.midi_transcriber = MIDIToJianpuTranscriber()
         self.is_playing = False
+        self.player.set_stop_check(lambda: not self.is_playing)
         self.current_midi_file = None  # Track currently loaded MIDI for re-transcription
 
         self.setup_ui()
@@ -135,6 +136,13 @@ class MusicPlayerGUI:
                                    width=10, textvariable=self.tempo_var)
         tempo_spinbox.grid(row=1, column=3, sticky=tk.W, padx=(10, 0), pady=(10, 0))
 
+        ttk.Label(settings_frame, text="Timing:").grid(row=1, column=5, sticky=tk.W, padx=(20, 0), pady=(10, 0))
+        self.timing_mode_var = tk.StringVar(value=self.player.timing_mode)
+        timing_combo = ttk.Combobox(settings_frame, textvariable=self.timing_mode_var, width=10,
+                        values=["strict", "legacy"], state="readonly")
+        timing_combo.grid(row=1, column=6, sticky=tk.W, padx=(6, 0), pady=(10, 0))
+        timing_combo.bind("<<ComboboxSelected>>", lambda e: self.update_timing_mode())
+
         # Mode info label
         self.mode_info_var = tk.StringVar(value="Guqin mode: slow, expressive")
         mode_info_label = ttk.Label(settings_frame, textvariable=self.mode_info_var, foreground="gray")
@@ -233,12 +241,14 @@ class MusicPlayerGUI:
         mode = self.filter_var.get()
         if mode == "full":
             self.midi_transcriber.set_transcription_options(
+                max_notes=self.midi_transcriber.max_notes,
                 min_duration=0.001,
                 remove_duplicates=False
             )
             self.filter_info_var.set("Full: all notes, no filtering")
         elif mode == "clean":
             self.midi_transcriber.set_transcription_options(
+                max_notes=self.midi_transcriber.max_notes,
                 min_duration=0.1,
                 remove_duplicates=True,
                 duplicate_threshold=0.1
@@ -246,6 +256,7 @@ class MusicPlayerGUI:
             self.filter_info_var.set("Clean: removes short notes (<100ms)")
         elif mode == "minimal":
             self.midi_transcriber.set_transcription_options(
+                max_notes=self.midi_transcriber.max_notes,
                 min_duration=0.2,
                 remove_duplicates=True,
                 duplicate_threshold=0.15
@@ -257,6 +268,16 @@ class MusicPlayerGUI:
         if self.current_midi_file:
             self.log(f"Re-transcribing MIDI with {mode} filter...")
             self._retranscribe_midi()
+
+    def update_timing_mode(self):
+        """Update playback timing behavior.
+
+        strict: respect explicit durations/rests and avoid adding extra fixed gaps.
+        legacy: always add note_delay between non-wait tokens.
+        """
+        mode = self.timing_mode_var.get().strip().lower() or "strict"
+        self.player.set_timing_mode(mode)
+        self.log(f"Timing mode set to: {self.player.timing_mode}")
 
     def _retranscribe_midi(self):
         """Re-transcribe the currently loaded MIDI file with new filter settings."""
@@ -297,6 +318,9 @@ class MusicPlayerGUI:
             "  • Fast: 4x speed, no waits\n"
             "  • Custom: User-defined tempo multiplier\n\n"
             "Tempo: Speed multiplier (1.0 = normal, 2.0 = 2x faster)\n\n"
+            "Timing:\n"
+            "  • Strict: honors explicit durations/rests without extra fixed delay\n"
+            "  • Legacy: adds Note Delay between all non-wait tokens\n\n"
             "MIDI Filter:\n"
             "  • Full: All notes, no filtering (may sound busy)\n"
             "  • Clean: Removes short notes <100ms (recommended)\n"
@@ -669,12 +693,15 @@ class MusicPlayerGUI:
                     return
 
                 if self.player.validate_note(note):
-                    self.player.play_single_note(note)
+                    success = self.player.play_single_note(note)
+                    if not success and not self.is_playing:
+                        return
                     self.log(f"Test note {i}: {note}")
 
                     if i < len(notes) and self.is_playing:
-                        self.log(f"Delay: {self.player.note_delay}s")
-                        time.sleep(self.player.note_delay)
+                        if self.player.should_add_inter_note_delay(note):
+                            self.log(f"Delay: {self.player.note_delay}s")
+                            time.sleep(self.player.note_delay)
 
             self.log("Delay test completed!")
 
@@ -713,6 +740,9 @@ class MusicPlayerGUI:
 
         # MIDI: use MIDI transcriber
         if file_ext in ['.mid', '.midi']:
+            # New MIDI selection should not inherit manual track indices from a prior file.
+            if self.current_midi_file != file_path:
+                self.midi_transcriber.selected_tracks = None
             self.upload_status_var.set("Transcribing MIDI...")
             self.log(f"Selected MIDI file: {file_path}")
             processing_thread = threading.Thread(
@@ -812,6 +842,8 @@ class MusicPlayerGUI:
 
         file_name = os.path.basename(file_path)
         self.file_path_var.set(file_name)
+        if self.current_midi_file != file_path:
+            self.midi_transcriber.selected_tracks = None
         self.upload_status_var.set("Transcribing MIDI...")
         self.log(f"Selected MIDI file: {file_path}")
 
@@ -948,7 +980,7 @@ class MusicPlayerGUI:
                 def update_song_input():
                     self.song_text.delete(1.0, tk.END)
                     self.song_text.insert(1.0, jianpu_notes)
-                    note_count = len(jianpu_notes.split())
+                    note_count = len(self.player.parse_notes(jianpu_notes))
                     self.upload_status_var.set(f"✅ Transcribed {note_count} notes from MIDI ({self.filter_var.get()} filter)")
 
                 self.root.after(0, update_song_input)
@@ -1047,6 +1079,7 @@ class MusicPlayerGUI:
                 return
 
         # Start playing in a separate thread
+        self.player.clear_stop_request()
         self.is_playing = True
         self.play_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL)
@@ -1089,16 +1122,19 @@ class MusicPlayerGUI:
                     return
 
                 if self.player.validate_note(note):
-                    self.player.play_single_note(note)
+                    success = self.player.play_single_note(note)
+                    if not success and not self.is_playing:
+                        return
                     self.log(f"Played note {i}/{len(notes)}: {note}")
 
                     # Add delay between notes (except after the last note)
                     if i < len(notes) and self.is_playing:
-                        time.sleep(self.player.note_delay)
+                        if self.player.should_add_inter_note_delay(note):
+                            time.sleep(self.player.note_delay)
 
         except Exception as e:
             self.log(f"Error during playback: {e}")
-            messagebox.showerror("Playback Error", f"An error occurred: {e}")
+            self.root.after(0, lambda: messagebox.showerror("Playback Error", f"An error occurred: {e}"))
         finally:
             # Reset UI state
             self.is_playing = False
@@ -1114,6 +1150,7 @@ class MusicPlayerGUI:
     def stop_playing(self):
         """Stop the current playback."""
         self.is_playing = False
+        self.player.request_stop()
         self.log("Playback stopped by user")
 
     def update_status(self, message):

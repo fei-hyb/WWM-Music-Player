@@ -146,7 +146,8 @@ class MIDIToJianpuTranscriber:
             merged_track = mido.merge_tracks(tracks_to_use)
 
             # Track note states for proper duration calculation
-            active_notes = {}  # {(channel, note_number): (start_time, velocity)}
+            # {(channel, note_number): (start_time_seconds, velocity, tempo_at_note_on)}
+            active_notes = {}
             current_time = 0
             tempo = 500000  # Default tempo (120 BPM)
             ticks_per_beat = mid.ticks_per_beat
@@ -174,7 +175,7 @@ class MIDIToJianpuTranscriber:
                         continue
 
                     # Store both start time and velocity with channel
-                    active_notes[(channel, msg.note)] = (current_time, msg.velocity)
+                    active_notes[(channel, msg.note)] = (current_time, msg.velocity, tempo)
 
                 # Handle note off events (including note_on with velocity 0)
                 elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
@@ -182,23 +183,25 @@ class MIDIToJianpuTranscriber:
                     key = (channel, msg.note)
 
                     if key in active_notes:
-                        start_time, velocity = active_notes[key]
+                        start_time, velocity, tempo_at_on = active_notes[key]
                         duration = current_time - start_time
+                        seconds_per_beat = max(tempo_at_on / 1000000.0, 0.001)
+                        duration_beats = duration / seconds_per_beat
 
                         # Convert MIDI note to Jianpu
                         jianpu_note = self._midi_note_to_jianpu(msg.note)
                         if jianpu_note:
                             # Store velocity normalized to 0-1
-                            all_notes.append((start_time, jianpu_note, duration, velocity / 127.0))
+                            all_notes.append((start_time, jianpu_note, duration, velocity / 127.0, duration_beats))
 
                         del active_notes[key]
 
             # Handle any remaining active notes (songs that don't end cleanly)
-            for (channel, note_num), (start_time, velocity) in active_notes.items():
+            for (channel, note_num), (start_time, velocity, _tempo_at_on) in active_notes.items():
                 jianpu_note = self._midi_note_to_jianpu(note_num)
                 if jianpu_note:
                     duration = 0.5  # Default duration for unclosed notes
-                    all_notes.append((start_time, jianpu_note, duration, velocity / 127.0))
+                    all_notes.append((start_time, jianpu_note, duration, velocity / 127.0, 1.0))
 
             if all_notes:
                 # Sort by time and convert to string
@@ -267,8 +270,6 @@ class MIDIToJianpuTranscriber:
 
         return best_track
 
-        return best_track
-
     def _try_music21_transcription(self, midi_path: str) -> Optional[str]:
         """Try transcribing using music21 library."""
         try:
@@ -288,7 +289,7 @@ class MIDIToJianpuTranscriber:
                     if jianpu_note:
                         duration = float(element.quarterLength)
                         offset = float(element.offset)
-                        notes.append((offset, jianpu_note, duration))
+                        notes.append((offset, jianpu_note, duration, 0.8, duration))
 
                 elif isinstance(element, note.Chord):
                     # For chords, take the highest note
@@ -298,12 +299,12 @@ class MIDIToJianpuTranscriber:
                     if jianpu_note:
                         duration = float(element.quarterLength)
                         offset = float(element.offset)
-                        notes.append((offset, jianpu_note, duration))
+                        notes.append((offset, jianpu_note, duration, 0.8, duration))
 
             if notes:
                 # Sort by time and convert to string
                 notes.sort(key=lambda x: x[0])
-                return self._notes_to_jianpu_string(notes)
+                return self._notes_to_jianpu_string_advanced(notes)
 
         except ImportError:
             logger.info("music21 library not available")
@@ -330,12 +331,12 @@ class MIDIToJianpuTranscriber:
                         jianpu_note = self._midi_note_to_jianpu(note.pitch)
                         if jianpu_note:
                             duration = note.end - note.start
-                            notes.append((note.start, jianpu_note, duration))
+                            notes.append((note.start, jianpu_note, duration, 0.8, None))
 
             if notes:
                 # Sort by time and convert to string
                 notes.sort(key=lambda x: x[0])
-                return self._notes_to_jianpu_string(notes)
+                return self._notes_to_jianpu_string_advanced(notes)
 
         except ImportError:
             logger.info("pretty_midi library not available")
@@ -459,10 +460,10 @@ class MIDIToJianpuTranscriber:
             Jianpu notation string
         """
         # Convert to advanced format with default velocity
-        notes_with_velocity = [(t, n, d, 0.8) for t, n, d in notes]
+        notes_with_velocity = [(t, n, d, 0.8, None) for t, n, d in notes]
         return self._notes_to_jianpu_string_advanced(notes_with_velocity)
 
-    def _notes_to_jianpu_string_advanced(self, notes: List[Tuple[float, str, float, float]]) -> str:
+    def _notes_to_jianpu_string_advanced(self, notes: List[Tuple[float, str, float, float, Optional[float]]]) -> str:
         """
         Advanced conversion with chord detection and accurate rhythm preservation.
 
@@ -478,7 +479,7 @@ class MIDIToJianpuTranscriber:
         total_raw = len(notes)
 
         # Filter out very short notes (likely grace notes or noise)
-        filtered_notes = [(t, n, d, v) for t, n, d, v in notes if d >= self.min_duration]
+        filtered_notes = [(t, n, d, v, b) for t, n, d, v, b in notes if d >= self.min_duration]
         after_duration = len(filtered_notes)
 
         # Remove rapid duplicates if enabled
@@ -520,16 +521,18 @@ class MIDIToJianpuTranscriber:
         range_counts = {'Low': 0, 'Med': 0, 'High': 0, 'Other': 0}
 
         while i < len(filtered_notes):
-            time, note, duration, velocity = filtered_notes[i]
+            time, note, duration, velocity, beats = filtered_notes[i]
+            selected_dur = duration
+            selected_beats = beats
 
             # Detect chords (notes starting at nearly the same time)
-            chord_group = [(time, note, duration, velocity)]
+            chord_group = [(time, note, duration, velocity, beats)]
             j = i + 1
 
             while j < len(filtered_notes):
-                next_time, next_note, next_dur, next_vel = filtered_notes[j]
+                next_time, next_note, next_dur, next_vel, next_beats = filtered_notes[j]
                 if abs(next_time - time) <= self.chord_time_window:
-                    chord_group.append((next_time, next_note, next_dur, next_vel))
+                    chord_group.append((next_time, next_note, next_dur, next_vel, next_beats))
                     j += 1
                 else:
                     break
@@ -545,21 +548,25 @@ class MIDIToJianpuTranscriber:
 
                     # Output chord in bracket notation for simultaneous key presses
                     chord_notes = []
-                    for chord_time, chord_note, chord_dur, chord_vel in chord_group:
-                        note_with_duration = self._add_duration_marker(chord_note, chord_dur)
+                    for chord_time, chord_note, chord_dur, chord_vel, chord_beats in chord_group:
+                        note_with_duration = self._add_duration_marker(chord_note, chord_dur, chord_beats)
                         chord_notes.append(note_with_duration)
                         range_counts[_range_from_label(chord_note)] += 1
                     # Format: [Med1:q Med3:q Med5:q] for simultaneous playback
                     jianpu_sequence.append("[" + " ".join(chord_notes) + "]")
+                    selected_dur = max((c[2] for c in chord_group), default=duration)
+                    selected_beats = max((c[4] for c in chord_group if c[4] is not None), default=beats)
                 else:
                     # Legacy: output all notes in the chord group sequentially
-                    for chord_time, chord_note, chord_dur, chord_vel in chord_group:
-                        note_with_duration = self._add_duration_marker(chord_note, chord_dur)
+                    for chord_time, chord_note, chord_dur, chord_vel, chord_beats in chord_group:
+                        note_with_duration = self._add_duration_marker(chord_note, chord_dur, chord_beats)
                         jianpu_sequence.append(note_with_duration)
                         range_counts[_range_from_label(chord_note)] += 1
+                    selected_dur = max((c[2] for c in chord_group), default=duration)
+                    selected_beats = max((c[4] for c in chord_group if c[4] is not None), default=beats)
             else:
-                selected_time, selected_note, selected_dur, selected_vel = chord_group[0]
-                note_with_duration = self._add_duration_marker(selected_note, selected_dur)
+                selected_time, selected_note, selected_dur, selected_vel, selected_beats = chord_group[0]
+                note_with_duration = self._add_duration_marker(selected_note, selected_dur, selected_beats)
                 jianpu_sequence.append(note_with_duration)
                 range_counts[_range_from_label(selected_note)] += 1
 
@@ -569,9 +576,12 @@ class MIDIToJianpuTranscriber:
                 next_time = filtered_notes[next_idx][0]
                 gap = next_time - (time + duration)
 
-                # Add rest marker for significant gaps
-                if gap > 0.3:
-                    jianpu_sequence.append("0")  # Rest symbol
+                # Add gap marker only when configured and gap exceeds threshold.
+                if self.add_wait_commands and gap > self.wait_threshold:
+                    # Derive a rough beat estimate for the gap from the current note.
+                    sec_per_beat = selected_dur / selected_beats if (selected_beats and selected_beats > 0) else None
+                    gap_beats = (gap / sec_per_beat) if sec_per_beat else None
+                    jianpu_sequence.append(self._add_duration_marker("0", gap, gap_beats))
 
             i = next_idx
 
@@ -586,7 +596,35 @@ class MIDIToJianpuTranscriber:
 
         return result
 
-    def _add_duration_marker(self, note: str, duration: float) -> str:
+    def _duration_code_from_beats(self, beats: float) -> str:
+        """Quantize beat length to duration code."""
+        if beats >= 3.0:
+            return 'w'
+        if beats >= 1.5:
+            return 'h'
+        if beats >= 0.75:
+            return 'q'
+        if beats >= 0.375:
+            return 'e'
+        if beats >= 0.1875:
+            return 's'
+        return 't'
+
+    def _duration_code_from_seconds(self, duration: float) -> str:
+        """Fallback quantization when beat information is unavailable."""
+        if duration >= 2.0:
+            return 'w'
+        if duration >= 1.0:
+            return 'h'
+        if duration >= 0.5:
+            return 'q'
+        if duration >= 0.25:
+            return 'e'
+        if duration >= 0.125:
+            return 's'
+        return 't'
+
+    def _add_duration_marker(self, note: str, duration: float, duration_beats: Optional[float] = None) -> str:
         """
         Add duration marker to note based on musical timing.
 
@@ -597,40 +635,30 @@ class MIDIToJianpuTranscriber:
         Returns:
             Note with duration marker (e.g., "High1:q" for quarter note)
         """
-        # Map duration to musical note lengths (approximate)
-        # Assuming 120 BPM as baseline (quarter = 0.5s)
-
-        if duration >= 2.0:
-            return f"{note}:w"  # Whole note
-        elif duration >= 1.0:
-            return f"{note}:h"  # Half note
-        elif duration >= 0.5:
-            return f"{note}:q"  # Quarter note
-        elif duration >= 0.25:
-            return f"{note}:e"  # Eighth note
-        elif duration >= 0.125:
-            return f"{note}:s"  # Sixteenth note
+        if duration_beats is not None and duration_beats > 0:
+            code = self._duration_code_from_beats(duration_beats)
         else:
-            return f"{note}:t"  # Thirty-second note
+            code = self._duration_code_from_seconds(duration)
+        return f"{note}:{code}"
 
-    def _remove_duplicate_notes_advanced(self, notes: List[Tuple[float, str, float, float]]) -> List[Tuple[float, str, float, float]]:
+    def _remove_duplicate_notes_advanced(self, notes: List[Tuple[float, str, float, float, Optional[float]]]) -> List[Tuple[float, str, float, float, Optional[float]]]:
         """Remove rapid repeated notes with velocity awareness."""
         if not notes:
             return notes
 
         filtered = [notes[0]]  # Always keep the first note
 
-        for time, note, duration, velocity in notes[1:]:
-            last_time, last_note, _, last_velocity = filtered[-1]
+        for time, note, duration, velocity, beats in notes[1:]:
+            last_time, last_note, _, last_velocity, _ = filtered[-1]
 
             # If it's the same note within the threshold time, keep only louder one
             if note == last_note and (time - last_time) < self.duplicate_threshold:
                 # Replace if current note is louder
                 if velocity > last_velocity:
-                    filtered[-1] = (time, note, duration, velocity)
+                    filtered[-1] = (time, note, duration, velocity, beats)
                 continue
 
-            filtered.append((time, note, duration, velocity))
+            filtered.append((time, note, duration, velocity, beats))
 
         return filtered
 

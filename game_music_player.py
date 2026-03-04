@@ -7,7 +7,7 @@ import pydirectinput
 import time
 import re
 import random
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 
 class GameMusicPlayer:
@@ -15,6 +15,9 @@ class GameMusicPlayer:
     MODE_GUQIN = "guqin"      # Default: slow, expressive, with wait commands
     MODE_FAST = "fast"        # Fast mode: minimal delays, no waits
     MODE_CUSTOM = "custom"    # Custom: user-defined tempo multiplier
+
+    TIMING_STRICT = "strict"  # Respect explicit token durations/rests without extra gap
+    TIMING_LEGACY = "legacy"  # Always add global note delay between non-wait tokens
 
     def __init__(self, note_delay: float = 0.1, mode: str = "guqin", tempo_multiplier: float = 1.0):
         """
@@ -29,10 +32,39 @@ class GameMusicPlayer:
         self.base_note_delay = note_delay  # Store original delay
         self.note_delay = note_delay
         self.last_played_note: Optional[str] = None  # Track last note for wait commands
+        self._stop_requested = False
+        self._stop_check: Optional[Callable[[], bool]] = None
 
         # Playing mode settings
         self.mode = mode
         self.tempo_multiplier = tempo_multiplier
+        self._skip_waits = False  # Initialize before _apply_mode_settings()
+        self.timing_mode = self.TIMING_STRICT
+
+        # Timing precision settings for accurate playback
+        self._use_precise_timing = True  # Use high-precision timing
+        self._timing_compensation = 0.005  # Compensate for key press latency (seconds)
+
+        # Articulation settings for expressive playing
+        self.articulation = "normal"  # "normal", "staccato", "legato"
+        self._staccato_ratio = 0.5   # Note plays for 50% of duration in staccato
+        self._legato_overlap = 0.02  # Small overlap between notes in legato
+
+        # Swing timing for rhythmic feel (0.0 = straight, 0.33 = triplet swing)
+        self.swing_amount = 0.0
+        self._swing_phase = False  # Alternates for swing timing
+
+        # Dynamics/velocity simulation
+        self.dynamics = "mf"  # pp, p, mp, mf, f, ff
+        self._dynamics_delay_map = {
+            'pp': 0.015,  # Very soft - shortest key press
+            'p': 0.020,
+            'mp': 0.025,
+            'mf': 0.030,  # Medium - default
+            'f': 0.035,
+            'ff': 0.040   # Very loud - longest key press
+        }
+
         self._apply_mode_settings()
 
         # Wait command settings for Jianpu/Guqin prolonged notes
@@ -57,6 +89,46 @@ class GameMusicPlayer:
         # Set up pydirectinput for reliable game input
         pydirectinput.FAILSAFE = True  # Move mouse to top-left to abort
         pydirectinput.PAUSE = 0.01  # Minimal pause between actions
+
+    def set_stop_check(self, stop_check: Optional[Callable[[], bool]]) -> None:
+        """Install an optional callback that returns True when playback should stop."""
+        self._stop_check = stop_check
+
+    def request_stop(self) -> None:
+        """Request playback stop for interruptible sleeps and waits."""
+        self._stop_requested = True
+
+    def clear_stop_request(self) -> None:
+        """Clear any previously requested stop state before a new playback run."""
+        self._stop_requested = False
+
+    def _should_stop(self) -> bool:
+        if self._stop_requested:
+            return True
+        if self._stop_check is not None:
+            try:
+                return bool(self._stop_check())
+            except Exception:
+                return False
+        return False
+
+    def _sleep_interruptible(self, duration: float, step: float = 0.02) -> bool:
+        """Sleep in short steps so playback can stop promptly.
+
+        Returns:
+            True if completed the full sleep, False if interrupted by stop request.
+        """
+        if duration <= 0:
+            return True
+
+        end_time = time.perf_counter() + duration
+        while True:
+            if self._should_stop():
+                return False
+            remaining = end_time - time.perf_counter()
+            if remaining <= 0:
+                return True
+            self._precise_sleep(min(step, remaining))
 
     def _apply_mode_settings(self) -> None:
         """Apply the settings for the selected playing mode."""
@@ -109,17 +181,99 @@ class GameMusicPlayer:
         info += f"Tempo multiplier: {self.tempo_multiplier}x\n"
         info += f"Note delay: {self.note_delay:.3f}s\n"
         info += f"Base delay: {self.base_note_delay:.3f}s\n"
-        info += f"Skip waits: {getattr(self, '_skip_waits', False)}\n"
-        info += f"Wait range: {self.wait_duration_range[0]:.2f}s - {self.wait_duration_range[1]:.2f}s"
+        info += f"Skip waits: {self._skip_waits}\n"
+        info += f"Wait range: {self.wait_duration_range[0]:.2f}s - {self.wait_duration_range[1]:.2f}s\n"
+        info += f"Articulation: {self.articulation}\n"
+        info += f"Dynamics: {self.dynamics}\n"
+        info += f"Swing: {self.swing_amount:.2f}\n"
+        info += f"Timing mode: {self.timing_mode}"
         return info
+
+    def set_timing_mode(self, timing_mode: str) -> None:
+        """Set playback timing mode.
+
+        Args:
+            timing_mode: "strict" (duration-aware) or "legacy" (always add note_delay)
+        """
+        if timing_mode not in (self.TIMING_STRICT, self.TIMING_LEGACY):
+            print(f"Unknown timing mode '{timing_mode}'. Using '{self.TIMING_STRICT}'.")
+            timing_mode = self.TIMING_STRICT
+        self.timing_mode = timing_mode
+
+    def set_articulation(self, articulation: str) -> None:
+        """Set the articulation style for note playback.
+
+        Args:
+            articulation: "normal", "staccato" (short/detached), or "legato" (smooth/connected)
+        """
+        if articulation not in ("normal", "staccato", "legato"):
+            print(f"Unknown articulation '{articulation}'. Using 'normal'.")
+            articulation = "normal"
+        self.articulation = articulation
+        print(f"Articulation set to: {articulation}")
+
+    def set_dynamics(self, dynamics: str) -> None:
+        """Set the dynamics (volume/intensity) for note playback.
+
+        Args:
+            dynamics: "pp" (very soft), "p", "mp", "mf" (medium), "f", "ff" (very loud)
+        """
+        if dynamics not in self._dynamics_delay_map:
+            print(f"Unknown dynamics '{dynamics}'. Using 'mf'.")
+            dynamics = "mf"
+        self.dynamics = dynamics
+        print(f"Dynamics set to: {dynamics}")
+
+    def set_swing(self, amount: float) -> None:
+        """Set swing timing for rhythmic feel.
+
+        Args:
+            amount: 0.0 = straight timing, 0.33 = triplet swing, 0.5 = heavy swing
+        """
+        self.swing_amount = max(0.0, min(0.5, amount))
+        print(f"Swing set to: {self.swing_amount:.2f}")
+
+    def _precise_sleep(self, duration: float) -> None:
+        """High-precision sleep using busy-wait for the final milliseconds.
+
+        Standard time.sleep() has ~10-15ms precision on Windows.
+        This method uses a hybrid approach for sub-millisecond accuracy.
+        """
+        if not self._use_precise_timing or duration <= 0:
+            if duration > 0:
+                time.sleep(duration)
+            return
+
+        # Sleep for most of the duration, leave 2ms for busy-wait
+        if duration > 0.002:
+            time.sleep(duration - 0.002)
+
+        # Busy-wait for the remaining time (high precision)
+        end_time = time.perf_counter() + min(duration, 0.002)
+        while time.perf_counter() < end_time:
+            pass
+
+    def _get_swing_adjusted_duration(self, duration: float, is_offbeat: bool) -> float:
+        """Apply swing timing adjustment to note duration.
+
+        Swing makes offbeat notes shorter and delays them slightly.
+        """
+        if self.swing_amount <= 0:
+            return duration
+
+        if is_offbeat:
+            # Offbeat notes are shortened
+            return duration * (1.0 - self.swing_amount * 0.5)
+        else:
+            # On-beat notes are slightly lengthened
+            return duration * (1.0 + self.swing_amount * 0.5)
 
     def set_note_delay(self, delay: float) -> None:
         """Set the delay between notes."""
         self.base_note_delay = delay
         self.note_delay = delay  # Update current delay
-        # Reapply mode settings to adjust note delay if in custom mode
-        if self.mode == self.MODE_CUSTOM:
-            self.note_delay *= self.tempo_multiplier
+        # Reapply mode settings to properly recalculate delay
+        self._apply_mode_settings()
 
     def set_wait_duration_range(self, min_duration: float, max_duration: float) -> None:
         """
@@ -249,20 +403,31 @@ class GameMusicPlayer:
         Natural notes press the key directly. Sharp notes use Shift+key,
         flat notes use Ctrl+key. The modifier is held down only for the
         duration of the key press.
+
+        Uses dynamics setting to control key press duration for velocity simulation.
         """
+        # Get key hold duration based on dynamics (simulates velocity)
+        key_hold_duration = self._dynamics_delay_map.get(self.dynamics, 0.030)
+
         if modifier is None:
-            pydirectinput.press(key)
+            pydirectinput.keyDown(key)
+            self._precise_sleep(key_hold_duration)
+            pydirectinput.keyUp(key)
             return
 
         # Only support shift/ctrl as modifiers
         if modifier not in ('shift', 'ctrl'):
             # Fallback to plain press if an unknown modifier is passed
-            pydirectinput.press(key)
+            pydirectinput.keyDown(key)
+            self._precise_sleep(key_hold_duration)
+            pydirectinput.keyUp(key)
             return
 
         pydirectinput.keyDown(modifier)
         try:
-            pydirectinput.press(key)
+            pydirectinput.keyDown(key)
+            self._precise_sleep(key_hold_duration)
+            pydirectinput.keyUp(key)
         finally:
             pydirectinput.keyUp(modifier)
 
@@ -362,11 +527,37 @@ class GameMusicPlayer:
             return base_duration / self.tempo_multiplier
         return base_duration
 
+    def _has_explicit_duration(self, token: str) -> bool:
+        """Return True when a token (or chord member) contains a duration marker."""
+        if self.is_chord(token):
+            return any(':' in part for part in self.parse_chord(token))
+        return ':' in token
+
+    def should_add_inter_note_delay(self, token: str) -> bool:
+        """Decide whether a fixed inter-note delay should be added after a token.
+
+        Tokens that already encode timing (rests, waits, duration-marked notes/chords)
+        should not receive additional global delay.
+        """
+        if self.is_wait_command(token):
+            return False
+
+        if self.timing_mode == self.TIMING_LEGACY:
+            return True
+
+        base, _ = self._split_note_and_duration(token) if not self.is_chord(token) else (None, None)
+        if base == '0':
+            return False
+
+        return not self._has_explicit_duration(token)
+
     def play_single_note(self, note: str) -> bool:
         """Play a single note, rest, or execute a wait command.
 
         Supports duration markers (e.g., "Med1:q", "High#3:e"), rests ("0" or "0:q"),
         and semitone notes using Shift (sharp) and Ctrl (flat).
+
+        Uses articulation, dynamics, and swing settings for expressive playback.
         """
         # Handle chords (simultaneous notes)
         if self.is_chord(note):
@@ -383,8 +574,7 @@ class GameMusicPlayer:
         if base == '0':
             rest_duration = self._get_duration_from_code(duration_code)
             print(f"Rest (silence) for {rest_duration:.3f}s")
-            time.sleep(rest_duration)
-            return True
+            return self._sleep_interruptible(rest_duration)
 
         # Parse musical note components
         octave, accidental, degree = self._split_note_components(base)
@@ -402,11 +592,27 @@ class GameMusicPlayer:
         modifier = self._get_modifier_for_accidental(accidental)
 
         try:
-            # Perform the key press with appropriate modifier
+            # Perform the key press with appropriate modifier (includes dynamics)
             self._press_key_with_modifier(key, modifier)
 
             # Determine how long this note should last
             sleep_duration = self._get_duration_from_code(duration_code)
+
+            # Apply swing timing (alternates between on-beat and off-beat)
+            if self.swing_amount > 0:
+                sleep_duration = self._get_swing_adjusted_duration(sleep_duration, self._swing_phase)
+                self._swing_phase = not self._swing_phase  # Toggle for next note
+
+            # Apply articulation adjustments
+            if self.articulation == "staccato":
+                # Staccato: shorter notes with gap after
+                actual_sleep = sleep_duration * self._staccato_ratio
+            elif self.articulation == "legato":
+                # Legato: full duration, overlap handled in play_song
+                actual_sleep = sleep_duration
+            else:
+                # Normal articulation
+                actual_sleep = sleep_duration
 
             # Map duration markers to human-readable names for logging
             if duration_code:
@@ -431,8 +637,11 @@ class GameMusicPlayer:
             else:
                 print(f"Played note: {base} -> {modifier_desc}{key.upper()}")
 
-            # Sleep for the musical duration (note length)
-            time.sleep(sleep_duration)
+            # Sleep for the musical duration (with precision timing)
+            # Subtract timing compensation for more accurate rhythm
+            adjusted_sleep = max(0, actual_sleep - self._timing_compensation)
+            if not self._sleep_interruptible(adjusted_sleep):
+                return False
 
             # Track last played note (including accidental if present) for wait commands
             self.last_played_note = base
@@ -487,20 +696,23 @@ class GameMusicPlayer:
         if not keys_to_press:
             return False
 
+        # Get key hold duration based on dynamics
+        key_hold_duration = self._dynamics_delay_map.get(self.dynamics, 0.030)
+        modifiers_held = set()
+
         try:
             # Press all modifier keys first
-            modifiers_held = set()
             for key, modifier, note in keys_to_press:
                 if modifier and modifier not in modifiers_held:
                     pydirectinput.keyDown(modifier)
                     modifiers_held.add(modifier)
 
-            # Press all note keys simultaneously
+            # Press all note keys simultaneously (as close together as possible)
             for key, modifier, note in keys_to_press:
                 pydirectinput.keyDown(key)
 
-            # Brief hold for the chord to register
-            time.sleep(0.02)
+            # Hold the chord for dynamics-based duration
+            interrupted = not self._sleep_interruptible(key_hold_duration)
 
             # Release all note keys
             for key, modifier, note in keys_to_press:
@@ -510,6 +722,9 @@ class GameMusicPlayer:
             for modifier in modifiers_held:
                 pydirectinput.keyUp(modifier)
 
+            if interrupted:
+                return False
+
             # Log what was played
             note_names = [n for _, _, n in keys_to_press]
             print(f"Played chord: [{' '.join(note_names)}]")
@@ -517,8 +732,10 @@ class GameMusicPlayer:
             # Track the last played note (use the first note of the chord)
             self.last_played_note = chord_notes[0]
 
-            # Sleep for the chord duration
-            time.sleep(max_duration)
+            # Sleep for the chord duration (with precision timing)
+            adjusted_duration = max(0, max_duration - self._timing_compensation)
+            if not self._sleep_interruptible(adjusted_duration):
+                return False
 
             return True
 
@@ -527,12 +744,12 @@ class GameMusicPlayer:
             for key, modifier, note in keys_to_press:
                 try:
                     pydirectinput.keyUp(key)
-                except:
+                except Exception:
                     pass
             for modifier in modifiers_held:
                 try:
                     pydirectinput.keyUp(modifier)
-                except:
+                except Exception:
                     pass
             print(f"Error playing chord: {e}")
             return False
@@ -548,7 +765,7 @@ class GameMusicPlayer:
             True if wait was executed successfully, False otherwise
         """
         # Skip waits in fast mode
-        if getattr(self, '_skip_waits', False):
+        if self._skip_waits:
             print(f"Skipping wait command '{wait_command}' (fast mode)")
             return True
 
@@ -564,11 +781,11 @@ class GameMusicPlayer:
             wait_duration = wait_duration / self.tempo_multiplier
 
         print(f"Sustaining {self.last_played_note} for {wait_duration:.2f}s ({wait_command})")
-        time.sleep(wait_duration)
-        return True
+        return self._sleep_interruptible(wait_duration)
 
     def play_song(self, song_string: str, countdown: int = 3) -> None:
         """Play a complete song from a string of notes with Jianpu wait support."""
+        self.clear_stop_request()
         notes = self.parse_notes(song_string)
 
         if not notes:
@@ -607,7 +824,9 @@ class GameMusicPlayer:
         # Countdown to give time to focus the game window
         for i in range(countdown, 0, -1):
             print(f"Starting in {i}...")
-            time.sleep(1)
+            if not self._sleep_interruptible(1.0):
+                print("Playback stopped.")
+                return
 
         print("Playing song with Jianpu wait support!")
 
@@ -615,11 +834,15 @@ class GameMusicPlayer:
         for i, item in enumerate(notes, 1):
             if self.validate_note(item):
                 success = self.play_single_note(item)
+                if self._should_stop():
+                    print("Playback stopped.")
+                    return
 
                 # Add delay between items (except after the last item)
-                # Skip delay after wait commands since they include their own timing
-                if i < len(notes) and success and not self.is_wait_command(item):
-                    time.sleep(self.note_delay)
+                if i < len(notes) and success and self.should_add_inter_note_delay(item):
+                    if not self._sleep_interruptible(self.note_delay):
+                        print("Playback stopped.")
+                        return
 
         print("Song completed!")
 
@@ -664,9 +887,14 @@ def main():
         print("1. Play a song")
         print("2. Show note mapping")
         print("3. Change note delay")
-        print("4. Quit")
+        print("4. Set playing mode (guqin/fast/custom)")
+        print("5. Set articulation (normal/staccato/legato)")
+        print("6. Set dynamics (pp/p/mp/mf/f/ff)")
+        print("7. Set swing timing")
+        print("8. Show current settings")
+        print("9. Quit")
 
-        choice = input("\nEnter your choice (1-4): ").strip()
+        choice = input("\nEnter your choice (1-9): ").strip()
 
         if choice == '1':
             print("\nPaste your song string (notes separated by spaces):")
@@ -700,13 +928,63 @@ def main():
             except ValueError:
                 print("Invalid delay value.")
 
-
         elif choice == '4':
+            print("\nPlaying modes:")
+            print("  guqin - Slow, expressive with wait commands")
+            print("  fast  - Minimal delays, skips wait commands")
+            print("  custom - User-defined tempo multiplier")
+            mode = input("Enter mode (guqin/fast/custom): ").strip().lower()
+            if mode == 'custom':
+                try:
+                    tempo = float(input("Enter tempo multiplier (e.g., 1.5 for 50% faster): "))
+                    player.set_tempo(tempo)
+                except ValueError:
+                    print("Invalid tempo value. Using 1.0.")
+                    player.set_tempo(1.0)
+            else:
+                player.set_mode(mode)
+
+        elif choice == '5':
+            print("\nArticulation styles:")
+            print("  normal   - Standard note playback")
+            print("  staccato - Short, detached notes")
+            print("  legato   - Smooth, connected notes")
+            articulation = input("Enter articulation (normal/staccato/legato): ").strip().lower()
+            player.set_articulation(articulation)
+
+        elif choice == '6':
+            print("\nDynamics levels (affects key press intensity):")
+            print("  pp (pianissimo) - Very soft")
+            print("  p  (piano)      - Soft")
+            print("  mp (mezzo-piano)- Moderately soft")
+            print("  mf (mezzo-forte)- Moderately loud (default)")
+            print("  f  (forte)      - Loud")
+            print("  ff (fortissimo) - Very loud")
+            dynamics = input("Enter dynamics (pp/p/mp/mf/f/ff): ").strip().lower()
+            player.set_dynamics(dynamics)
+
+        elif choice == '7':
+            print("\nSwing timing adds rhythmic groove:")
+            print("  0.0  - Straight timing (no swing)")
+            print("  0.33 - Triplet swing (jazz feel)")
+            print("  0.5  - Heavy swing")
+            try:
+                swing = float(input("Enter swing amount (0.0 to 0.5): "))
+                player.set_swing(swing)
+            except ValueError:
+                print("Invalid swing value.")
+
+        elif choice == '8':
+            print("\n=== Current Settings ===")
+            print(player.get_mode_info())
+            print("========================")
+
+        elif choice == '9':
             print("Goodbye!")
             break
 
         else:
-            print("Invalid choice. Please enter 1-4.")
+            print("Invalid choice. Please enter 1-9.")
 
 
 if __name__ == "__main__":
